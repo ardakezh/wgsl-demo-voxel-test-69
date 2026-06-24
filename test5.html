@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>WebGPU Voxel Engine (Infinite Toroidal Shift)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #111; color: #fff; font-family: monospace; touch-action: none; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+        #debug-panel { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.8); padding: 10px; border: 1px solid #444; z-index: 10; pointer-events: none; }
+        
+        #controls-move { position: absolute; bottom: 30px; left: 30px; display: grid; grid-template-columns: 70px 70px 70px; grid-template-rows: 70px 70px; gap: 10px; z-index: 10; }
+        #btn-w { grid-column: 2; grid-row: 1; }
+        #btn-a { grid-column: 1; grid-row: 2; }
+        #btn-s { grid-column: 2; grid-row: 2; }
+        #btn-d { grid-column: 3; grid-row: 2; }
+
+        #controls-height { position: absolute; bottom: 30px; right: 30px; display: flex; flex-direction: column; gap: 15px; z-index: 10; }
+
+        .btn { width: 70px; height: 70px; background: rgba(255,255,255,0.1); border: 2px solid rgba(255,255,255,0.5); border-radius: 50%; color: #fff; font-size: 32px; display: flex; align-items: center; justify-content: center; user-select: none; -webkit-user-select: none; cursor: pointer; }
+        .btn:active { background: rgba(255,255,255,0.4); }
+    </style>
+</head>
+<body>
+    <div id="debug-panel">
+        <div>FPS: <span id="fps">0</span></div>
+        <div>Yaw: <span id="yaw">0</span>°</div>
+        <div>Cam Height: <span id="cam-height">0</span></div>
+        <div>World X: <span id="w-x">0</span></div>
+        <div>World Z: <span id="w-z">0</span></div>
+    </div>
+    
+    <div id="controls-move">
+        <div id="btn-w" class="btn">W</div>
+        <div id="btn-a" class="btn">A</div>
+        <div id="btn-s" class="btn">S</div>
+        <div id="btn-d" class="btn">D</div>
+    </div>
+
+    <div id="controls-height">
+        <div id="btn-up" class="btn">↑</div>
+        <div id="btn-down" class="btn">↓</div>
+    </div>
+
+    <canvas id="gpu-canvas"></canvas>
+
+<script>
+const WGSL_CULL = `
+struct CameraUniform {
+    cam_x: f32, cam_z: f32, cam_h: f32, cam_h_u32: u32,
+    f_x: f32, f_z: f32, r_x: f32, r_z: f32,
+    c_pos: vec2<f32>, l_pos: vec2<f32>,
+    r_pos: vec2<f32>, aspect: f32, pad1: f32,
+};
+
+struct VertexOut {
+    @builtin(position) pos: vec4<f32>,
+};
+
+@group(0) @binding(0) var h_map: texture_2d<u32>;
+@group(0) @binding(1) var<storage, read_write> v_top: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> v_ns: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> v_ew: array<vec4<f32>>;
+@group(0) @binding(4) var<uniform> cam: CameraUniform;
+@group(0) @binding(5) var color_ao_tex: texture_storage_2d<rgba8unorm, write>;
+
+@vertex
+fn vs(@builtin(vertex_index) id: u32) -> VertexOut {
+    var out: VertexOut;
+    var abs_pos: vec2<f32>;
+
+    if (id == 0u) { abs_pos = cam.c_pos; }
+    else if (id == 1u) { abs_pos = cam.l_pos; }
+    else { abs_pos = cam.r_pos; }
+
+    let nx = (abs_pos.x / 256.0) - 1.0;
+    let ny = 1.0 - (abs_pos.y / 256.0);
+    out.pos = vec4<f32>(nx, ny, 0.0, 1.0);
+    return out;
+}
+
+fn get_proj_pos(gx: f32, gz: f32, h: f32) -> vec4<f32> {
+    let dx = gx - cam.cam_x;
+    let dz = gz - cam.cam_z;
+    
+    let view_x = dx * cam.r_x + dz * cam.r_z;
+    let view_z = dx * cam.f_x + dz * cam.f_z;
+    let view_y = h - cam.cam_h;
+    
+    let clip_x = (view_x * 1.5) / cam.aspect;
+    let clip_y = view_y * 1.5;
+    
+    let near = 1.0;
+    let far = 1000.0;
+    let clip_z = (far / (far - near)) * (view_z - near);
+    
+    return vec4<f32>(clip_x, clip_y, clip_z, view_z);
+}
+
+@fragment
+fn fs(in: VertexOut) -> @location(0) vec4<u32> {
+    let gx = u32(floor(in.pos.x));
+    let gy = u32(floor(in.pos.y));
+    if (gx >= 512u || gy >= 512u) { discard; }
+
+    let igrid = vec2<i32>(i32(gx), i32(gy));
+    let h = textureLoad(h_map, igrid, 0).r;
+    
+    var gen_top = false; var gen_ew = false; var gen_ns = false;
+    var h_ew = 0u; var h_ns = 0u;
+
+    if (f32(h) <= cam.cam_h) { gen_top = true; }
+
+    let eval_e = (f32(gx) - cam.cam_x) < 0.0;
+    let eval_s = (f32(gy) - cam.cam_z) < 0.0; 
+
+    if (eval_e) {
+        let e_coord = igrid + vec2<i32>(1, 0);
+        if (e_coord.x < 512) {
+            let eh = textureLoad(h_map, e_coord, 0).r;
+            if (eh < h) { gen_ew = true; h_ew = eh; }
+        } else { gen_ew = true; h_ew = 0u; }
+    } else {
+        let w_coord = igrid + vec2<i32>(-1, 0);
+        if (w_coord.x >= 0) {
+            let wh = textureLoad(h_map, w_coord, 0).r;
+            if (wh < h) { gen_ew = true; h_ew = wh; }
+        } else { gen_ew = true; h_ew = 0u; }
+    }
+
+    if (eval_s) {
+        let s_coord = igrid + vec2<i32>(0, 1);
+        if (s_coord.y < 512) {
+            let sh = textureLoad(h_map, s_coord, 0).r;
+            if (sh < h) { gen_ns = true; h_ns = sh; }
+        } else { gen_ns = true; h_ns = 0u; }
+    } else {
+        let n_coord = igrid + vec2<i32>(0, -1);
+        if (n_coord.y >= 0) {
+            let nh = textureLoad(h_map, n_coord, 0).r;
+            if (nh < h) { gen_ns = true; h_ns = nh; }
+        } else { gen_ns = true; h_ns = 0u; }
+    }
+
+    if (!gen_top && !gen_ew && !gen_ns) { discard; }
+
+    if (gen_top) {
+        var ao_x = false;
+        var ao_z = false;
+
+        if (eval_e) {
+            let w_coord = igrid + vec2<i32>(-1, 0);
+            if (w_coord.x >= 0 && textureLoad(h_map, w_coord, 0).r > h) { ao_x = true; }
+        } else {
+            let e_coord = igrid + vec2<i32>(1, 0);
+            if (e_coord.x < 512 && textureLoad(h_map, e_coord, 0).r > h) { ao_x = true; }
+        }
+
+        if (eval_s) {
+            let n_coord = igrid + vec2<i32>(0, -1);
+            if (n_coord.y >= 0 && textureLoad(h_map, n_coord, 0).r > h) { ao_z = true; }
+        } else {
+            let s_coord = igrid + vec2<i32>(0, 1);
+            if (s_coord.y < 512 && textureLoad(h_map, s_coord, 0).r > h) { ao_z = true; }
+        }
+
+        let alpha = (f32(ao_x) * 1.0 + f32(ao_z) * 2.0) / 3.0;
+        let norm_h = f32(h - 20u) / 70.0;
+        let r = 0.2 + norm_h * 0.3;
+        let g = 0.5 + norm_h * 0.4;
+        let b = 0.2 + norm_h * 0.2;
+        textureStore(color_ao_tex, igrid, vec4<f32>(r, g, b, alpha));
+    }
+
+    let base_idx = (gy * 512u + gx) * 4u;
+    let fx0 = f32(gx); let fx1 = f32(gx + 1u);
+    let fz0 = f32(gy); let fz1 = f32(gy + 1u);
+    let fy_curr = f32(h);
+
+    if (gen_top) {
+        v_top[base_idx + 0u] = get_proj_pos(fx0, fz0, fy_curr);
+        v_top[base_idx + 1u] = get_proj_pos(fx1, fz0, fy_curr);
+        v_top[base_idx + 2u] = get_proj_pos(fx0, fz1, fy_curr);
+        v_top[base_idx + 3u] = get_proj_pos(fx1, fz1, fy_curr);
+    }
+
+    if (gen_ew) {
+        let fy_neigh = f32(h_ew);
+        let x_act = select(fx0, fx1, eval_e);
+        v_ew[base_idx + 0u] = get_proj_pos(x_act, fz0, fy_curr);
+        v_ew[base_idx + 1u] = get_proj_pos(x_act, fz1, fy_curr);
+        v_ew[base_idx + 2u] = get_proj_pos(x_act, fz0, fy_neigh);
+        v_ew[base_idx + 3u] = get_proj_pos(x_act, fz1, fy_neigh);
+    }
+
+    if (gen_ns) {
+        let fy_neigh = f32(h_ns);
+        let z_act = select(fz0, fz1, eval_s);
+        v_ns[base_idx + 0u] = get_proj_pos(fx0, z_act, fy_curr);
+        v_ns[base_idx + 1u] = get_proj_pos(fx1, z_act, fy_curr);
+        v_ns[base_idx + 2u] = get_proj_pos(fx0, z_act, fy_neigh);
+        v_ns[base_idx + 3u] = get_proj_pos(fx1, z_act, fy_neigh);
+    }
+
+    var mask_val = 0u;
+    if (gen_top) { mask_val |= 1u; }
+    if (gen_ns) { mask_val |= 2u; }
+    if (gen_ew) { mask_val |= 4u; }
+    
+    return vec4<u32>(mask_val, 0u, 0u, 0u);
+}
+`;
+
+const WGSL_COMPUTE = `
+struct IndirectDraw { idx_count: atomic<u32>, inst_count: u32, first_idx: u32, base_vtx: u32, first_inst: u32 };
+
+@group(0) @binding(0) var mask: texture_2d<u32>;
+@group(0) @binding(1) var<storage, read_write> i_top: IndirectDraw;
+@group(0) @binding(2) var<storage, read_write> i_ns: IndirectDraw;
+@group(0) @binding(3) var<storage, read_write> i_ew: IndirectDraw;
+@group(0) @binding(4) var<storage, read_write> idx_top: array<u32>;
+@group(0) @binding(5) var<storage, read_write> idx_ns: array<u32>;
+@group(0) @binding(6) var<storage, read_write> idx_ew: array<u32>;
+
+@compute @workgroup_size(16, 16, 1)
+fn cs(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= 512u || gid.y >= 512u) { return; }
+    let m = textureLoad(mask, vec2<i32>(i32(gid.x), i32(gid.y)), 0).r;
+    if (m == 0u) { return; }
+
+    let base = (gid.y * 512u + gid.x) * 4u;
+    if ((m & 1u) != 0u) {
+        let start = atomicAdd(&i_top.idx_count, 6u);
+        idx_top[start+0u]=base; idx_top[start+1u]=base+1u; idx_top[start+2u]=base+2u;
+        idx_top[start+3u]=base+2u; idx_top[start+4u]=base+1u; idx_top[start+5u]=base+3u;
+    }
+    if ((m & 2u) != 0u) {
+        let start = atomicAdd(&i_ns.idx_count, 6u);
+        idx_ns[start+0u]=base; idx_ns[start+1u]=base+1u; idx_ns[start+2u]=base+2u;
+        idx_ns[start+3u]=base+2u; idx_ns[start+4u]=base+1u; idx_ns[start+5u]=base+3u;
+    }
+    if ((m & 4u) != 0u) {
+        let start = atomicAdd(&i_ew.idx_count, 6u);
+        idx_ew[start+0u]=base; idx_ew[start+1u]=base+1u; idx_ew[start+2u]=base+2u;
+        idx_ew[start+3u]=base+2u; idx_ew[start+4u]=base+1u; idx_ew[start+5u]=base+3u;
+    }
+}
+`;
+
+const WGSL_RENDER_TOP = `
+struct CameraUniform {
+    cam_x: f32, cam_z: f32, cam_h: f32, cam_h_u32: u32,
+    f_x: f32, f_z: f32, r_x: f32, r_z: f32,
+    c_pos: vec2<f32>, l_pos: vec2<f32>,
+    r_pos: vec2<f32>, aspect: f32, pad1: f32,
+};
+@group(0) @binding(0) var<uniform> cam: CameraUniform;
+@group(0) @binding(1) var color_ao_tex: texture_2d<f32>;
+
+struct VertexOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec3<f32>,
+    @location(1) ao: f32,
+};
+
+@vertex
+fn vs(@location(0) pos: vec4<f32>, @builtin(vertex_index) vid: u32) -> VertexOut {
+    var out: VertexOut;
+    out.pos = pos;
+
+    let grid_idx = vid / 4u;
+    let local_vid = vid % 4u;
+    let gx = grid_idx % 512u;
+    let gy = grid_idx / 512u;
+
+    let tex_val = textureLoad(color_ao_tex, vec2<i32>(i32(gx), i32(gy)), 0);
+    let alpha_val = round(tex_val.a * 3.0);
+    let ao_x = (alpha_val == 1.0 || alpha_val == 3.0);
+    let ao_z = (alpha_val == 2.0 || alpha_val == 3.0);
+
+    let eval_e = (f32(gx) - cam.cam_x) < 0.0;
+    let eval_s = (f32(gy) - cam.cam_z) < 0.0;
+
+    var ao_mult = 1.0;
+    if (ao_x) {
+        if (eval_e && (local_vid == 0u || local_vid == 2u)) { ao_mult *= 0.5; }
+        if (!eval_e && (local_vid == 1u || local_vid == 3u)) { ao_mult *= 0.5; }
+    }
+    if (ao_z) {
+        if (eval_s && (local_vid == 0u || local_vid == 1u)) { ao_mult *= 0.5; }
+        if (!eval_s && (local_vid == 2u || local_vid == 3u)) { ao_mult *= 0.5; }
+    }
+
+    out.color = tex_val.rgb;
+    out.ao = ao_mult;
+    return out;
+}
+
+@fragment
+fn fs(in: VertexOut) -> @location(0) vec4<f32> {
+    let inv_ao = 1.0 - in.ao;
+    let ao_edge = inv_ao * inv_ao;
+    return vec4<f32>(in.color * (1.0 - ao_edge), 1.0);
+}
+`;
+
+const WGSL_RENDER_SIDE = `
+struct RenderUniforms { color: vec4<f32> };
+@group(0) @binding(0) var<uniform> params: RenderUniforms;
+
+struct VertexOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec3<f32>,
+    @location(1) ao: f32,
+};
+
+@vertex
+fn vs(@location(0) pos: vec4<f32>, @builtin(vertex_index) vid: u32) -> VertexOut {
+    var out: VertexOut;
+    out.pos = pos;
+    
+    let local_vid = vid % 4u;
+    var ao_mult = 1.0;
+    if (local_vid >= 2u) {
+        ao_mult = 0.3;
+    }
+    
+    out.color = params.color.rgb;
+    out.ao = ao_mult;
+    return out;
+}
+
+@fragment
+fn fs(in: VertexOut) -> @location(0) vec4<f32> {
+    let inv_ao = 1.0 - in.ao;
+    let ao_edge = inv_ao * inv_ao;
+    return vec4<f32>(in.color * (1.0 - ao_edge), params.color.a);
+}
+`;
+
+function getNoise(world_x, world_z) {
+    let noise = Math.sin(world_x/30)*Math.cos(world_z/30) + Math.sin(world_x/10+world_z/20)*0.5;
+    return 20 + Math.floor((noise * 0.5 + 0.5) * 70);
+}
+
+async function init() {
+    const adapter = await navigator.gpu.requestAdapter();
+    const device = await adapter.requestDevice();
+    const canvas = document.getElementById('gpu-canvas');
+    canvas.width = window.innerWidth; canvas.height = window.innerHeight;
+    const context = canvas.getContext('webgpu');
+    const format = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({ device, format });
+
+    window.addEventListener('resize', () => {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+    });
+
+    const texConfig = { size: [512, 512, 1], format: 'r16uint', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC };
+    const texHeightmapA = device.createTexture(texConfig);
+    const texHeightmapB = device.createTexture(texConfig);
+    
+    let activeTex = texHeightmapA;
+    let inactiveTex = texHeightmapB;
+
+    const texMask = device.createTexture({ 
+        size: [512, 512, 1], format: 'r8uint', 
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING 
+    });
+    const texColorAO = device.createTexture({
+        size: [512, 512, 1], format: 'rgba8unorm',
+        usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING
+    });
+    
+    const heightData = new Uint16Array(512 * 512);
+    for (let y = 0; y < 512; y++) {
+        for (let x = 0; x < 512; x++) {
+            heightData[y*512+x] = getNoise(x, y);
+        }
+    }
+    device.queue.writeTexture({ texture: texHeightmapA }, heightData, { bytesPerRow: 512 * 2 }, [512, 512, 1]);
+    device.queue.writeTexture({ texture: texHeightmapB }, heightData, { bytesPerRow: 512 * 2 }, [512, 512, 1]);
+
+    const vBufSize = 512 * 512 * 4 * 16; 
+    const vTop = device.createBuffer({ size: vBufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX });
+    const vNS = device.createBuffer({ size: vBufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX });
+    const vEW = device.createBuffer({ size: vBufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX });
+
+    // FIX: Index buffers correctly mapped to the 512x512 physical limit
+    const iBufSize = 512 * 512 * 6 * 4;
+    const idxTop = device.createBuffer({ size: iBufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDEX });
+    const idxNS = device.createBuffer({ size: iBufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDEX });
+    const idxEW = device.createBuffer({ size: iBufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDEX });
+
+    const indTop = device.createBuffer({ size: 20, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST });
+    const indNS = device.createBuffer({ size: 20, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST });
+    const indEW = device.createBuffer({ size: 20, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST });
+
+    const camUniform = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    let depthTexture = device.createTexture({ size: [canvas.width, canvas.height, 1], format: 'depth24plus', usage: GPUTextureUsage.RENDER_ATTACHMENT });
+
+    const renderParamsNS = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const renderParamsEW = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(renderParamsNS, 0, new Float32Array([0.45, 0.45, 0.45, 1.0]));
+    device.queue.writeBuffer(renderParamsEW, 0, new Float32Array([0.3, 0.3, 0.3, 1.0]));
+
+    const cullPass = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module: device.createShaderModule({ code: WGSL_CULL }), entryPoint: 'vs' },
+        fragment: { module: device.createShaderModule({ code: WGSL_CULL }), entryPoint: 'fs', targets: [{ format: 'r8uint' }] },
+        primitive: { topology: 'triangle-list' }
+    });
+
+    const computePass = device.createComputePipeline({
+        layout: 'auto',
+        compute: { module: device.createShaderModule({ code: WGSL_COMPUTE }), entryPoint: 'cs' }
+    });
+
+    const renderPassTop = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { 
+            module: device.createShaderModule({ code: WGSL_RENDER_TOP }), entryPoint: 'vs',
+            buffers: [{ arrayStride: 16, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x4' }] }]
+        },
+        fragment: { module: device.createShaderModule({ code: WGSL_RENDER_TOP }), entryPoint: 'fs', targets: [{ format }] },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: { depthWriteEnabled: true, depthCompare: 'less', format: 'depth24plus' }
+    });
+
+    const renderPassSide = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { 
+            module: device.createShaderModule({ code: WGSL_RENDER_SIDE }), entryPoint: 'vs',
+            buffers: [{ arrayStride: 16, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x4' }] }]
+        },
+        fragment: { module: device.createShaderModule({ code: WGSL_RENDER_SIDE }), entryPoint: 'fs', targets: [{ format }] },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: { depthWriteEnabled: true, depthCompare: 'less', format: 'depth24plus' }
+    });
+
+    let cullBG = null;
+    function updateCullBindGroup() {
+        cullBG = device.createBindGroup({
+            layout: cullPass.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: activeTex.createView() },
+                { binding: 1, resource: { buffer: vTop } },
+                { binding: 2, resource: { buffer: vNS } },
+                { binding: 3, resource: { buffer: vEW } },
+                { binding: 4, resource: { buffer: camUniform } },
+                { binding: 5, resource: texColorAO.createView() }
+            ]
+        });
+    }
+    updateCullBindGroup();
+
+    const compBG = device.createBindGroup({
+        layout: computePass.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: texMask.createView() },
+            { binding: 1, resource: { buffer: indTop } },
+            { binding: 2, resource: { buffer: indNS } },
+            { binding: 3, resource: { buffer: indEW } },
+            { binding: 4, resource: { buffer: idxTop } },
+            { binding: 5, resource: { buffer: idxNS } },
+            { binding: 6, resource: { buffer: idxEW } }
+        ]
+    });
+
+    const rBGTop = device.createBindGroup({ layout: renderPassTop.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: camUniform } }, { binding: 1, resource: texColorAO.createView() }] });
+    const rBGNS = device.createBindGroup({ layout: renderPassSide.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: renderParamsNS } }] });
+    const rBGEW = device.createBindGroup({ layout: renderPassSide.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: renderParamsEW } }] });
+
+    const initIndirect = new Uint32Array([0, 1, 0, 0, 0]);
+
+    // Input & Toroidal State
+    let yaw = 0.0;
+    let camHeight = 100.0;
+    let world_x = 255.5;
+    let world_z = 255.5;
+    let last_int_x = 255;
+    let last_int_z = 255;
+    
+    let moveUp = false; let moveDown = false;
+    let moveW = false; let moveA = false; let moveS = false; let moveD = false;
+    let isDragging = false; let lastTouchX = 0;
+
+    const bindBtn = (id, setTrue, setFalse) => {
+        const el = document.getElementById(id);
+        el.addEventListener('touchstart', setTrue, {passive: false});
+        el.addEventListener('mousedown', setTrue);
+        el.addEventListener('touchend', setFalse);
+        el.addEventListener('mouseup', setFalse);
+        el.addEventListener('mouseleave', setFalse);
+    };
+
+    bindBtn('btn-up', (e) => { e.preventDefault(); moveUp = true; }, (e) => { e.preventDefault(); moveUp = false; });
+    bindBtn('btn-down', (e) => { e.preventDefault(); moveDown = true; }, (e) => { e.preventDefault(); moveDown = false; });
+    bindBtn('btn-w', (e) => { e.preventDefault(); moveW = true; }, (e) => { e.preventDefault(); moveW = false; });
+    bindBtn('btn-a', (e) => { e.preventDefault(); moveA = true; }, (e) => { e.preventDefault(); moveA = false; });
+    bindBtn('btn-s', (e) => { e.preventDefault(); moveS = true; }, (e) => { e.preventDefault(); moveS = false; });
+    bindBtn('btn-d', (e) => { e.preventDefault(); moveD = true; }, (e) => { e.preventDefault(); moveD = false; });
+
+    const handleStart = (clientX) => { isDragging = true; lastTouchX = clientX; };
+    const handleMove = (clientX) => {
+        if (!isDragging) return;
+        yaw -= (clientX - lastTouchX) * 0.005;
+        lastTouchX = clientX;
+    };
+    const handleStop = () => { isDragging = false; };
+
+    canvas.addEventListener('touchstart', (e) => handleStart(e.touches[0].clientX), {passive: false});
+    canvas.addEventListener('touchmove', (e) => handleMove(e.touches[0].clientX), {passive: false});
+    canvas.addEventListener('touchend', handleStop);
+    canvas.addEventListener('mousedown', (e) => handleStart(e.clientX));
+    canvas.addEventListener('mousemove', (e) => handleMove(e.clientX));
+    canvas.addEventListener('mouseup', handleStop);
+    canvas.addEventListener('mouseleave', handleStop);
+
+    let lastTime = performance.now();
+    let fpsTimer = lastTime;
+    let frames = 0;
+
+    function frame(currentTime) {
+        let dt = (currentTime - lastTime) / 1000.0;
+        lastTime = currentTime;
+        frames++;
+
+        if (currentTime - fpsTimer >= 1000) { 
+            document.getElementById('fps').innerText = frames; 
+            frames = 0; 
+            fpsTimer = currentTime; 
+        }
+
+        if (depthTexture.width !== canvas.width || depthTexture.height !== canvas.height) {
+            depthTexture.destroy();
+            depthTexture = device.createTexture({ size: [canvas.width, canvas.height, 1], format: 'depth24plus', usage: GPUTextureUsage.RENDER_ATTACHMENT });
+        }
+
+        if (moveUp) camHeight += 80.0 * dt;
+        if (moveDown) camHeight -= 80.0 * dt;
+        camHeight = Math.max(10.0, Math.min(camHeight, 150.0));
+
+        let inputX = (moveD ? 1 : 0) - (moveA ? 1 : 0);
+        let inputZ = (moveS ? 1 : 0) - (moveW ? 1 : 0);
+        let len = Math.sqrt(inputX*inputX + inputZ*inputZ);
+        if (len > 0) {
+            inputX /= len; inputZ /= len;
+            let f_x = -Math.sin(yaw); let f_z = -Math.cos(yaw);
+            let r_x = Math.cos(yaw);  let r_z = -Math.sin(yaw);
+            let dx = inputX * r_x - inputZ * f_x;
+            let dz = inputX * r_z - inputZ * f_z;
+            world_x += dx * 50.0 * dt;
+            world_z += dz * 50.0 * dt;
+        }
+
+        document.getElementById('yaw').innerText = (yaw * (180/Math.PI) % 360).toFixed(1);
+        document.getElementById('cam-height').innerText = camHeight.toFixed(1);
+        document.getElementById('w-x').innerText = world_x.toFixed(1);
+        document.getElementById('w-z').innerText = world_z.toFixed(1);
+
+        let curr_x = Math.floor(world_x);
+        let curr_z = Math.floor(world_z);
+        let bindGroupDirty = false;
+
+        while (curr_x > last_int_x) {
+            let cEnc = device.createCommandEncoder();
+            cEnc.copyTextureToTexture({texture: activeTex, origin: [1, 0, 0]}, {texture: inactiveTex, origin: [0, 0, 0]}, [511, 512, 1]);
+            device.queue.submit([cEnc.finish()]);
+            
+            last_int_x++;
+            let colData = new Uint16Array(512);
+            let wx = 511 + last_int_x - 255;
+            for(let y=0; y<512; y++) colData[y] = getNoise(wx, y + last_int_z - 255);
+            device.queue.writeTexture({texture: inactiveTex, origin: [511, 0, 0]}, colData, {bytesPerRow: 2}, [1, 512, 1]);
+            
+            let temp = activeTex; activeTex = inactiveTex; inactiveTex = temp;
+            bindGroupDirty = true;
+        }
+        while (curr_x < last_int_x) {
+            let cEnc = device.createCommandEncoder();
+            cEnc.copyTextureToTexture({texture: activeTex, origin: [0, 0, 0]}, {texture: inactiveTex, origin: [1, 0, 0]}, [511, 512, 1]);
+            device.queue.submit([cEnc.finish()]);
+            
+            last_int_x--;
+            let colData = new Uint16Array(512);
+            let wx = 0 + last_int_x - 255;
+            for(let y=0; y<512; y++) colData[y] = getNoise(wx, y + last_int_z - 255);
+            device.queue.writeTexture({texture: inactiveTex, origin: [0, 0, 0]}, colData, {bytesPerRow: 2}, [1, 512, 1]);
+            
+            let temp = activeTex; activeTex = inactiveTex; inactiveTex = temp;
+            bindGroupDirty = true;
+        }
+        while (curr_z > last_int_z) {
+            let cEnc = device.createCommandEncoder();
+            cEnc.copyTextureToTexture({texture: activeTex, origin: [0, 1, 0]}, {texture: inactiveTex, origin: [0, 0, 0]}, [512, 511, 1]);
+            device.queue.submit([cEnc.finish()]);
+            
+            last_int_z++;
+            let rowData = new Uint16Array(512);
+            let wz = 511 + last_int_z - 255;
+            for(let x=0; x<512; x++) rowData[x] = getNoise(x + last_int_x - 255, wz);
+            device.queue.writeTexture({texture: inactiveTex, origin: [0, 511, 0]}, rowData, {bytesPerRow: 1024}, [512, 1, 1]);
+            
+            let temp = activeTex; activeTex = inactiveTex; inactiveTex = temp;
+            bindGroupDirty = true;
+        }
+        while (curr_z < last_int_z) {
+            let cEnc = device.createCommandEncoder();
+            cEnc.copyTextureToTexture({texture: activeTex, origin: [0, 0, 0]}, {texture: inactiveTex, origin: [0, 1, 0]}, [512, 511, 1]);
+            device.queue.submit([cEnc.finish()]);
+            
+            last_int_z--;
+            let rowData = new Uint16Array(512);
+            let wz = 0 + last_int_z - 255;
+            for(let x=0; x<512; x++) rowData[x] = getNoise(x + last_int_x - 255, wz);
+            device.queue.writeTexture({texture: inactiveTex, origin: [0, 0, 0]}, rowData, {bytesPerRow: 1024}, [512, 1, 1]);
+            
+            let temp = activeTex; activeTex = inactiveTex; inactiveTex = temp;
+            bindGroupDirty = true;
+        }
+
+        if (bindGroupDirty) updateCullBindGroup();
+
+        let f_x = -Math.sin(yaw); let f_z = -Math.cos(yaw);
+        let r_x = Math.cos(yaw); let r_z = -Math.sin(yaw);
+
+        let l_yaw = yaw + Math.PI/3; let r_yaw = yaw - Math.PI/3;
+        
+        let frac_x = world_x - Math.floor(world_x);
+        let frac_z = world_z - Math.floor(world_z);
+        
+        let center_x = 255.5 + frac_x;
+        let center_z = 255.5 + frac_z;
+        let lx = center_x + 512 * (-Math.sin(l_yaw)); 
+        let lz = center_z + 512 * (-Math.cos(l_yaw));
+        let rx = center_x + 512 * (-Math.sin(r_yaw)); 
+        let rz = center_z + 512 * (-Math.cos(r_yaw));
+
+        const camData = new Float32Array(16);
+        camData[0] = center_x; camData[1] = center_z; camData[2] = camHeight; 
+        new Uint32Array(camData.buffer)[3] = Math.floor(camHeight);
+        camData[4] = f_x; camData[5] = f_z; camData[6] = r_x; camData[7] = r_z;
+        camData[8] = center_x; camData[9] = center_z; 
+        camData[10] = lx; camData[11] = lz; 
+        camData[12] = rx; camData[13] = rz; 
+        camData[14] = canvas.width / canvas.height; camData[15] = 0.0;
+        device.queue.writeBuffer(camUniform, 0, camData);
+
+        device.queue.writeBuffer(indTop, 0, initIndirect);
+        device.queue.writeBuffer(indNS, 0, initIndirect);
+        device.queue.writeBuffer(indEW, 0, initIndirect);
+
+        const commandEncoder = device.createCommandEncoder();
+
+        const cullPassEnc = commandEncoder.beginRenderPass({
+            colorAttachments: [{ view: texMask.createView(), loadOp: 'clear', clearValue: [0, 0, 0, 0], storeOp: 'store' }]
+        });
+        cullPassEnc.setPipeline(cullPass);
+        cullPassEnc.setBindGroup(0, cullBG);
+        cullPassEnc.draw(3);
+        cullPassEnc.end();
+
+        const compPassEnc = commandEncoder.beginComputePass();
+        compPassEnc.setPipeline(computePass);
+        compPassEnc.setBindGroup(0, compBG);
+        compPassEnc.dispatchWorkgroups(32, 32, 1);
+        compPassEnc.end();
+
+        const renderPassEnc = commandEncoder.beginRenderPass({
+            colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: 'clear', clearValue: [0.1,0.1,0.1,1], storeOp: 'store' }],
+            depthStencilAttachment: { view: depthTexture.createView(), depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' }
+        });
+        
+        renderPassEnc.setPipeline(renderPassTop);
+        renderPassEnc.setBindGroup(0, rBGTop); 
+        renderPassEnc.setVertexBuffer(0, vTop); 
+        renderPassEnc.setIndexBuffer(idxTop, 'uint32'); 
+        renderPassEnc.drawIndexedIndirect(indTop, 0);
+
+        renderPassEnc.setPipeline(renderPassSide);
+        renderPassEnc.setBindGroup(0, rBGNS); 
+        renderPassEnc.setVertexBuffer(0, vNS); 
+        renderPassEnc.setIndexBuffer(idxNS, 'uint32'); 
+        renderPassEnc.drawIndexedIndirect(indNS, 0);
+        
+        renderPassEnc.setBindGroup(0, rBGEW); 
+        renderPassEnc.setVertexBuffer(0, vEW); 
+        renderPassEnc.setIndexBuffer(idxEW, 'uint32'); 
+        renderPassEnc.drawIndexedIndirect(indEW, 0);
+
+        renderPassEnc.end();
+        device.queue.submit([commandEncoder.finish()]);
+        requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+}
+init();
+</script>
+</body>
+</html>
